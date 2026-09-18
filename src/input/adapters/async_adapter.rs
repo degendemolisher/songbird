@@ -113,7 +113,14 @@ impl AsyncAdapterSink {
                 AdapterRequest::Seek(pos) => {
                     pause_buf_moves = true;
                     drop(self.resp_tx.send_async(AdapterResponse::SeekClear).await);
-                    seek_res = Some(self.stream.seek(pos).await);
+                    let res = self.stream.seek(pos).await;
+                    if let Ok(new_pos) = res {
+                        // bytes read before the seek belong to the old position
+                        read_region = 0..0;
+                        hit_end = false;
+                        seen_bytes = new_pos;
+                    }
+                    seek_res = Some(res);
                 },
                 AdapterRequest::SeekCleared => {
                     if let Some(res) = seek_res.take() {
@@ -142,6 +149,9 @@ pub struct AsyncAdapterStream {
     // there is no contention.
     bytes_out: Mutex<HeapCons<u8>>,
     can_seek: bool,
+    /// Bytes handed to the reader so far; the async half is further ahead by
+    /// whatever it has buffered, so relative seeks are resolved here.
+    pos: u64,
     // Note: these are Atomic just to work around the need for
     // check_messages to take &self rather than &mut.
     finalised: AtomicBool,
@@ -174,6 +184,7 @@ impl AsyncAdapterStream {
         let stream = AsyncAdapterStream {
             bytes_out,
             can_seek,
+            pos: 0,
             finalised: false.into(),
             bytes_known_present: false.into(),
             req_tx,
@@ -241,6 +252,7 @@ impl Read for AsyncAdapterStream {
             let mut rb = self.bytes_out.lock();
             match rb.read(buf) {
                 Ok(n) => {
+                    self.pos += n as u64;
                     self.notify_tx.notify_one();
                     return Ok(n);
                 },
@@ -273,6 +285,16 @@ impl Seek for AsyncAdapterStream {
 
         self.check_dropped()?;
 
+        let pos = match pos {
+            SeekFrom::Current(delta) => {
+                let target = self.pos.checked_add_signed(delta).ok_or_else(|| {
+                    IoError::new(IoErrorKind::InvalidInput, "seek before start of stream")
+                })?;
+                SeekFrom::Start(target)
+            },
+            other => other,
+        };
+
         _ = self.req_tx.send(AdapterRequest::Seek(pos));
 
         // wait for async to tell us that it has stopped writing,
@@ -290,11 +312,15 @@ impl Seek for AsyncAdapterStream {
 
         _ = self.req_tx.send(AdapterRequest::SeekCleared);
 
-        match self.handle_messages(Operation::Seek) {
+        let res = match self.handle_messages(Operation::Seek) {
             Some(AdapterResponse::SeekResult(a)) => a,
             None => self.check_dropped().map(|()| unreachable!()),
             _ => unreachable!(),
+        };
+        if let Ok(new_pos) = res {
+            self.pos = new_pos;
         }
+        res
     }
 }
 
