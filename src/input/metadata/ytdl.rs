@@ -8,7 +8,7 @@ use std::{collections::HashMap, time::Duration};
 /// Information returned by yt-dlp about a URL.
 ///
 /// Returned by [`crate::input::YoutubeDl::query`].
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Default)]
 pub struct Output {
     /// The main artist.
     pub artist: Option<String>,
