@@ -8,7 +8,6 @@ use crate::input::{
 };
 use async_trait::async_trait;
 use futures::{ready, TryStreamExt};
-use pin_project::pin_project;
 use reqwest::{
     header::{HeaderMap, ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, RANGE, RETRY_AFTER},
     Client,
@@ -67,11 +66,10 @@ impl HttpRequest {
             (Some(offset), None) => {
                 resp = resp.header(RANGE, format!("bytes={offset}-"));
             },
-            (offset, Some(max)) => {
-                resp = resp.header(
-                    RANGE,
-                    format!("bytes={}-{}", offset.unwrap_or(0), max.saturating_sub(1)),
-                );
+            (offset, Some(total)) => {
+                let start = offset.unwrap_or(0);
+                let end = total.min(start.saturating_add(MAX_RANGE));
+                resp = resp.header(RANGE, format!("bytes={start}-{}", end.saturating_sub(1)));
             },
             _ => {},
         }
@@ -114,16 +112,15 @@ impl HttpRequest {
 
             let len = total_len(headers, offset);
 
-            let resume = headers
+            let accepts_ranges = headers
                 .get(ACCEPT_RANGES)
                 .and_then(|a| a.to_str().ok())
-                .and_then(|a| {
-                    if a == "bytes" {
-                        Some(self.clone())
-                    } else {
-                        None
-                    }
-                });
+                .is_some_and(|a| a == "bytes")
+                || resp.status() == StatusCode::PARTIAL_CONTENT;
+            let resume = accepts_ranges.then(|| HttpRequest {
+                content_length: self.content_length.or(len),
+                ..self.clone()
+            });
 
             let stream = Box::new(StreamReader::new(
                 resp.bytes_stream().map_err(IoError::other),
@@ -134,7 +131,7 @@ impl HttpRequest {
                 len,
                 pos: offset,
                 resume,
-                pending_seek: None,
+                pending: None,
                 skip: 0,
             })
         }
@@ -161,20 +158,21 @@ fn total_len(headers: &HeaderMap, offset: u64) -> Option<u64> {
     })
 }
 
-type PendingSeek =
+type PendingRequest =
     Pin<Box<dyn Future<Output = Result<HttpStream, AudioStreamError>> + Send + Sync>>;
+
+/// googlevideo throttles any response larger than this to about the media bitrate.
+const MAX_RANGE: u64 = 10 * 1024 * 1024;
 
 /// Short hops forward are cheaper to read through than to reconnect for.
 const MAX_FORWARD_SKIP: u64 = 256 * 1024;
 
-#[pin_project]
 struct HttpStream {
-    #[pin]
     stream: Box<dyn AsyncRead + Send + Sync + Unpin>,
     len: Option<u64>,
     pos: u64,
     resume: Option<HttpRequest>,
-    pending_seek: Option<(u64, PendingSeek)>,
+    pending: Option<(u64, PendingRequest)>,
     skip: u64,
 }
 
@@ -201,6 +199,43 @@ impl HttpStream {
 
         Ok(target)
     }
+
+    /// The current response ended short of the resource, so the next window is fetched.
+    fn more_to_fetch(&self) -> bool {
+        self.resume.is_some() && self.len.is_some_and(|len| self.pos < len)
+    }
+
+    fn request_from(&mut self, target: u64) -> IoResult<()> {
+        let mut request = self.resume.clone().ok_or_else(|| {
+            IoError::new(
+                IoErrorKind::Unsupported,
+                "server does not accept byte ranges",
+            )
+        })?;
+        let fut = async move { request.create_stream(Some(target)).await };
+        self.pending = Some((target, Box::pin(fut)));
+        // free the connection now; the body is unusable once a new request starts
+        self.stream = Box::new(tokio::io::empty());
+
+        Ok(())
+    }
+
+    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
+        let Some((target, fut)) = self.pending.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+
+        let res = ready!(fut.as_mut().poll(cx));
+        let target = *target;
+        self.pending = None;
+
+        let new = res.map_err(|e| IoError::other(e.to_string()))?;
+        self.stream = new.stream;
+        self.len = new.len.or(self.len);
+        self.pos = target;
+
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl AsyncRead for HttpStream {
@@ -209,11 +244,21 @@ impl AsyncRead for HttpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
-        let this = self.project();
-        let before = buf.filled().len();
-        let res = ready!(AsyncRead::poll_read(this.stream, cx, buf));
-        *this.pos += (buf.filled().len() - before) as u64;
-        Poll::Ready(res)
+        let this = self.get_mut();
+
+        loop {
+            ready!(this.poll_pending(cx))?;
+
+            let before = buf.filled().len();
+            ready!(Pin::new(&mut this.stream).poll_read(cx, buf))?;
+            let read = (buf.filled().len() - before) as u64;
+            this.pos += read;
+
+            if read > 0 || !this.more_to_fetch() {
+                return Poll::Ready(Ok(()));
+            }
+            this.request_from(this.pos)?;
+        }
     }
 }
 
@@ -224,6 +269,7 @@ impl AsyncSeek for HttpStream {
 
         if Some(target) == this.len {
             this.stream = Box::new(tokio::io::empty());
+            this.pending = None;
             this.pos = target;
             return Ok(());
         }
@@ -233,18 +279,7 @@ impl AsyncSeek for HttpStream {
             return Ok(());
         }
 
-        let mut request = this.resume.clone().ok_or_else(|| {
-            IoError::new(
-                IoErrorKind::Unsupported,
-                "server does not accept byte ranges",
-            )
-        })?;
-        let fut = async move { request.create_stream(Some(target)).await };
-        this.pending_seek = Some((target, Box::pin(fut)));
-        // free the connection now; the body is unusable once a seek starts
-        this.stream = Box::new(tokio::io::empty());
-
-        Ok(())
+        this.request_from(target)
     }
 
     fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<u64>> {
@@ -263,20 +298,9 @@ impl AsyncSeek for HttpStream {
             this.skip -= n;
         }
 
-        let Some((target, fut)) = this.pending_seek.as_mut() else {
-            return Poll::Ready(Ok(this.pos));
-        };
+        ready!(this.poll_pending(cx))?;
 
-        let res = ready!(fut.as_mut().poll(cx));
-        let target = *target;
-        this.pending_seek = None;
-
-        let new = res.map_err(|e| IoError::other(e.to_string()))?;
-        this.stream = new.stream;
-        this.len = new.len.or(this.len);
-        this.pos = target;
-
-        Poll::Ready(Ok(target))
+        Poll::Ready(Ok(this.pos))
     }
 }
 
@@ -404,6 +428,28 @@ mod tests {
         let n = stream.read(&mut buf).await.expect("read at end");
         assert_eq!(n, 1);
         assert_eq!(stream.read(&mut buf).await.expect("eof"), 0);
+    }
+
+    #[tokio::test]
+    #[ntest::timeout(60_000)]
+    async fn http_stream_chains_bounded_windows() {
+        let mut req = HttpRequest::new(client(), target(HTTP_WEBM_TARGET));
+        let mut stream = req.create_stream(None).await.expect("first request");
+        let len = stream.byte_len().await.expect("length known");
+        assert!(len > MAX_RANGE, "resource must span more than one window");
+        let mut whole = Vec::new();
+        stream.read_to_end(&mut whole).await.expect("read whole");
+
+        let mut req = HttpRequest {
+            content_length: Some(len),
+            ..HttpRequest::new(client(), target(HTTP_WEBM_TARGET))
+        };
+        let mut stream = req.create_stream(None).await.expect("first window");
+        let mut windowed = Vec::new();
+        stream.read_to_end(&mut windowed).await.expect("read windows");
+
+        assert_eq!(windowed.len(), whole.len());
+        assert!(windowed == whole);
     }
 
     // NOTE: this covers youtube audio in a non-copyright-violating way, since
